@@ -1,0 +1,536 @@
+// controllers/StockController.ts
+import { Request, Response } from "express";
+import { ProductModel } from "../../models/schema/admin/products";
+import { Product_WarehouseModel } from "../../models/schema/admin/Product_Warehouse";
+import { WarehouseModel } from "../../models/schema/admin/Warehouse";
+import { BadRequest } from "../../Errors/BadRequest";
+import { NotFound } from "../../Errors/NotFound";
+import { SuccessResponse } from "../../utils/response";
+import { ProductPriceModel, ProductPriceOptionModel } from "../../models/schema/admin/product_price";
+import mongoose from "mongoose";
+
+// ==================== إضافة منتج لمخزن (مع دعم الـ Variations) ====================
+export const addProductToWarehouse = async (req: Request, res: Response) => {
+  const { warehouseId, products, productId, productPriceId, quantity, low_stock } = req.body;
+
+  if (!warehouseId) throw new BadRequest("Warehouse ID is required");
+
+  let productsToAdd = products;
+
+  // Support old format (single product)
+  if (!productsToAdd && productId) {
+    productsToAdd = [{ productId, productPriceId, quantity, low_stock }];
+  }
+
+  if (!productsToAdd || !Array.isArray(productsToAdd) || productsToAdd.length === 0) {
+    throw new BadRequest("Products array or a single product is required");
+  }
+
+  const warehouse = await WarehouseModel.findById(warehouseId);
+  if (!warehouse) throw new NotFound("Warehouse not found");
+
+  const results = [];
+  let totalQuantityAdded = 0;
+  let totalProductsAdded = 0;
+
+  // Loop through products to validate and add
+  for (const item of productsToAdd) {
+    const itemProductId = item.productId;
+    const itemProductPriceId = item.productPriceId;
+    const itemQuantity = item.quantity || 0;
+    const itemLowStock = item.low_stock || 0;
+
+    if (!itemProductId) throw new BadRequest("Product ID is required in all items");
+
+    const product = await ProductModel.findById(itemProductId);
+    if (!product) throw new NotFound(`Product ${itemProductId} not found`);
+
+    // ✅ لو فيه productPriceId، نتحقق منه
+    if (itemProductPriceId) {
+      const productPrice = await ProductPriceModel.findById(itemProductPriceId);
+      if (!productPrice) throw new NotFound(`Product variation ${itemProductPriceId} not found`);
+
+      // التأكد من أن الـ variation تابع للمنتج الصحيح
+      if (productPrice.productId.toString() !== itemProductId.toString()) {
+        throw new BadRequest(`Product variation does not belong to this product`);
+      }
+    }
+
+    // ✅ بناء query للبحث عن المنتج/الـ variation في المخزن
+    const existingQuery: any = { productId: itemProductId, warehouseId };
+    if (itemProductPriceId) {
+      existingQuery.productPriceId = itemProductPriceId;
+    } else {
+      existingQuery.productPriceId = null;
+    }
+
+    const existingStock = await Product_WarehouseModel.findOne(existingQuery);
+    if (existingStock) {
+      const variationText = itemProductPriceId ? " (this variation)" : "";
+      throw new BadRequest(`Product ${product.name || itemProductId}${variationText} already exists in this warehouse`);
+    }
+
+    const stock = await Product_WarehouseModel.create({
+      productId: itemProductId,
+      productPriceId: itemProductPriceId || null,
+      warehouseId,
+      quantity: itemQuantity,
+      low_stock: itemLowStock,
+    });
+
+    results.push(stock._id);
+    totalQuantityAdded += itemQuantity;
+    totalProductsAdded += 1;
+  }
+
+  await WarehouseModel.findByIdAndUpdate(warehouseId, {
+    $inc: {
+      number_of_products: totalProductsAdded,
+      stock_Quantity: totalQuantityAdded,
+    },
+  });
+
+  // populate للـ response
+  const populatedStocks = await Product_WarehouseModel.find({ _id: { $in: results } })
+    .populate("productId", "name ar_name image price")
+    .populate("productPriceId", "price code")
+    .populate("warehouseId", "name address");
+
+  SuccessResponse(res, {
+    message: "Products added to warehouse successfully",
+    stocks: populatedStocks,
+    // Return single object in 'stock' property if only 1 was added for backward compatibility
+    stock: populatedStocks.length === 1 ? populatedStocks[0] : populatedStocks,
+  });
+};
+
+// ==================== تحديث كمية منتج في مخزن (مع دعم الـ Variations) ====================
+export const updateProductStock = async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { productId, productPriceId, low_stock } = req.body;
+
+  if (!id) throw new BadRequest("Stock ID is required");
+
+  const stock = await Product_WarehouseModel.findById(id);
+  if (!stock) throw new NotFound("Stock not found");
+
+  // ✅ لو بيغير الـ Product
+  if (productId && productId !== stock.productId.toString()) {
+    const product = await ProductModel.findById(productId);
+    if (!product) throw new NotFound("Product not found");
+
+    // بناء query للتحقق من وجود المنتج/الـ variation في نفس المخزن
+    const existingQuery: any = {
+      productId: productId,
+      warehouseId: stock.warehouseId,
+      _id: { $ne: id },
+    };
+
+    // لو فيه productPriceId جديد
+    if (productPriceId !== undefined) {
+      existingQuery.productPriceId = productPriceId || null;
+    } else {
+      existingQuery.productPriceId = stock.productPriceId;
+    }
+
+    const existing = await Product_WarehouseModel.findOne(existingQuery);
+    if (existing) throw new BadRequest("Product already exists in this warehouse");
+
+    stock.productId = productId;
+  }
+
+  // ✅ لو بيغير الـ Variation
+  if (productPriceId !== undefined) {
+    if (productPriceId) {
+      const productPrice = await ProductPriceModel.findById(productPriceId);
+      if (!productPrice) throw new NotFound("Product variation not found");
+
+      if (productPrice.productId.toString() !== stock.productId.toString()) {
+        throw new BadRequest("Product variation does not belong to this product");
+      }
+    }
+    (stock as any).productPriceId = productPriceId || null;
+  }
+
+  // ✅ تحديث الـ low_stock
+  if (low_stock !== undefined) {
+    stock.low_stock = low_stock;
+  }
+
+  await stock.save();
+
+  const updatedStock = await Product_WarehouseModel.findById(id)
+    .populate("productId", "name ar_name image price")
+    .populate("productPriceId", "price code")
+    .populate("warehouseId", "name address");
+
+  SuccessResponse(res, {
+    message: "Stock updated successfully",
+    stock: updatedStock,
+  });
+};
+
+// ==================== حذف منتج من مخزن (مع دعم الـ Variations) ====================
+export const removeProductFromWarehouse = async (req: Request, res: Response) => {
+  const { productId, productPriceId, warehouseId } = req.body;
+
+  if (!productId) throw new BadRequest("Product ID is required");
+  if (!warehouseId) throw new BadRequest("Warehouse ID is required");
+
+  // بناء query للحذف
+  const deleteQuery: any = { productId, warehouseId };
+  // ✅ لو اتبعتت (حتى لو null) لازم نحدد الـ variation بالظبط
+  // null = المنتج الأساسي بدون variation
+  if (productPriceId !== undefined) {
+    deleteQuery.productPriceId = productPriceId || null;
+  }
+
+  const stock = await Product_WarehouseModel.findOneAndDelete(deleteQuery);
+  if (!stock) {
+    // إذا لم يكن موجوداً، نعتبره محذوفاً بنجاح
+    return SuccessResponse(res, {
+      message: "Product is already not in this warehouse",
+    });
+  }
+
+  await WarehouseModel.findByIdAndUpdate(warehouseId, {
+    $inc: {
+      number_of_products: -1,
+      stock_Quantity: -(stock.quantity || 0),
+    },
+  });
+
+  SuccessResponse(res, {
+    message: "Product removed from warehouse successfully",
+  });
+};
+
+// ==================== جلب منتجات مخزن معين (مع دعم الـ Variations) ====================
+// Shared by the admin product-warehouse page and the POS warehouse page so
+// both return exactly the same shape (warehouse, products, totalProducts).
+export const buildWarehouseProducts = async (warehouseId: string) => {
+  const warehouse = await WarehouseModel.findById(warehouseId);
+  if (!warehouse) throw new NotFound("Warehouse not found");
+
+  const stocks = await Product_WarehouseModel.find({ warehouseId })
+    .populate({
+      path: "productId",
+      populate: [{ path: "categoryId" }, { path: "brandId" }],
+    })
+    .populate("productPriceId", "price code quantity")
+    .lean();
+
+  const products = await Promise.all(
+    stocks.map(async (stock: any) => {
+      // لو مفيش productId
+      if (!stock.productId) return null;
+
+      // هات الـ Options للـ variation لو موجود
+      let variationOptions: any[] = [];
+      if (stock.productPriceId) {
+        const priceOptions = await ProductPriceOptionModel.find({
+          product_price_id: stock.productPriceId._id,
+        }).lean();
+
+        variationOptions = await Promise.all(
+          priceOptions.map(async (po: any) => {
+            if (!po.option_id) return null;
+            const option = await mongoose.model("Option").findById(po.option_id)
+              .populate("variationId", "name ar_name")
+              .lean();
+            return option;
+          })
+        );
+        variationOptions = variationOptions.filter((o) => o !== null);
+      }
+
+      // هات كل الـ Prices للمنتج (لو محتاج تعرضهم)
+      const prices = await ProductPriceModel.find({
+        productId: stock.productId._id,
+      }).lean();
+
+      const pricesWithOptions = await Promise.all(
+        prices.map(async (price: any) => {
+          const priceOptions = await ProductPriceOptionModel.find({
+            product_price_id: price._id,
+          }).lean();
+
+          const optionsWithDetails = await Promise.all(
+            priceOptions.map(async (po: any) => {
+              if (!po.option_id) return null;
+              const option = await mongoose.model("Option").findById(po.option_id)
+                .populate("variationId", "name ar_name")
+                .lean();
+              return option;
+            })
+          );
+
+          const validOptions = optionsWithDetails.filter((o) => o !== null);
+
+          return {
+            ...price,
+            options: validOptions,
+          };
+        })
+      );
+
+      return {
+        ...stock.productId,
+        // ✅ كمية المخزن الفعلية للصف ده (مش product.quantity الإجمالية)
+        quantity: stock.quantity,
+        stock_quantity: stock.quantity,
+        low_stock: stock.low_stock,
+        stockId: stock._id,
+        productPriceId: stock.productPriceId,  // الـ variation المحدد
+        variationOptions,  // الـ options بتاعة الـ variation
+        prices: pricesWithOptions,  // كل الـ prices المتاحة
+      };
+    })
+  );
+
+  // فلتر الـ null products
+  const validProducts = products.filter((p) => p !== null);
+
+  return {
+    warehouse,
+    products: validProducts,
+    totalProducts: validProducts.length,
+  };
+};
+
+export const getWarehouseProducts = async (req: Request, res: Response) => {
+  const { warehouseId } = req.params;
+  const data = await buildWarehouseProducts(warehouseId);
+  SuccessResponse(res, data);
+};
+
+// ==================== نقل كمية بين مخزنين (مع دعم الـ Variations) ====================
+export const transferStock = async (req: Request, res: Response) => {
+  const { productId, productPriceId, fromWarehouseId, toWarehouseId, quantity } = req.body;
+
+  if (!productId || !fromWarehouseId || !toWarehouseId || !quantity) {
+    throw new BadRequest("productId, fromWarehouseId, toWarehouseId, and quantity are required");
+  }
+
+  if (quantity <= 0) throw new BadRequest("Quantity must be positive");
+  if (fromWarehouseId === toWarehouseId) {
+    throw new BadRequest("Source and destination warehouses must be different");
+  }
+
+  // ✅ لو فيه productPriceId، نتحقق منه
+  if (productPriceId) {
+    const productPrice = await ProductPriceModel.findById(productPriceId);
+    if (!productPrice) throw new NotFound("Product variation not found");
+    if (productPrice.productId.toString() !== productId) {
+      throw new BadRequest("Product variation does not belong to this product");
+    }
+  }
+
+  // بناء query المصدر
+  const fromQuery: any = {
+    productId,
+    warehouseId: fromWarehouseId,
+  };
+  if (productPriceId) {
+    fromQuery.productPriceId = productPriceId;
+  } else {
+    fromQuery.productPriceId = null;
+  }
+
+  // ✅ Atomic Update - الخصم والتحقق في أمر واحد
+  const fromStock = await Product_WarehouseModel.findOneAndUpdate(
+    {
+      ...fromQuery,
+      quantity: { $gte: quantity }
+    },
+    {
+      $inc: { quantity: -quantity }
+    },
+    {
+      new: true
+    }
+  );
+
+  if (!fromStock) {
+    const existingStock = await Product_WarehouseModel.findOne(fromQuery);
+    
+    if (!existingStock) {
+      const variationText = productPriceId ? " (this variation)" : "";
+      throw new NotFound(`Product${variationText} not found in source warehouse`);
+    }
+    
+    throw new BadRequest(
+      `Insufficient quantity in source warehouse. Available: ${existingStock.quantity}, Requested: ${quantity}`
+    );
+  }
+
+  // بناء query الوجهة
+  const toQuery: any = {
+    productId,
+    warehouseId: toWarehouseId,
+  };
+  if (productPriceId) {
+    toQuery.productPriceId = productPriceId;
+  } else {
+    toQuery.productPriceId = null;
+  }
+
+  // ✅ شيك لو المنتج موجود في المخزن الوجهة قبل الـ upsert
+  const existingToStock = await Product_WarehouseModel.findOne(toQuery);
+  const isNewProductInWarehouse = !existingToStock;
+
+  // ✅ إضافة للمخزن الوجهة (upsert)
+  const toStock = await Product_WarehouseModel.findOneAndUpdate(
+    toQuery,
+    {
+      $inc: { quantity: quantity },
+      $setOnInsert: {
+        productId,
+        productPriceId: productPriceId || null,
+        warehouseId: toWarehouseId,
+        low_stock: fromStock.low_stock || 0,
+      }
+    },
+    {
+      new: true,
+      upsert: true
+    }
+  );
+
+  // ✅ تحديث المخزن المصدر
+  // شيك لو الكمية وصلت صفر، نقلل عدد المنتجات
+  const updatedFromStock = await Product_WarehouseModel.findById(fromStock._id);
+  const fromStockBecameZero = updatedFromStock && updatedFromStock.quantity === 0;
+
+  await WarehouseModel.findByIdAndUpdate(fromWarehouseId, {
+    $inc: { 
+      stock_Quantity: -quantity,
+      // ✅ لو الكمية وصلت صفر، نقلل عدد المنتجات
+      ...(fromStockBecameZero ? { number_of_products: -1 } : {})
+    },
+  });
+
+  // ✅ تحديث المخزن الوجهة
+  await WarehouseModel.findByIdAndUpdate(toWarehouseId, {
+    $inc: { 
+      stock_Quantity: quantity,
+      // ✅ لو منتج جديد، نزود عدد المنتجات
+      ...(isNewProductInWarehouse ? { number_of_products: 1 } : {})
+    },
+  });
+
+  // Populate للـ response
+  const populatedFromStock = await Product_WarehouseModel.findById(fromStock._id)
+    .populate("productId", "name ar_name")
+    .populate("productPriceId", "price code");
+  const populatedToStock = await Product_WarehouseModel.findById(toStock._id)
+    .populate("productId", "name ar_name")
+    .populate("productPriceId", "price code");
+
+  SuccessResponse(res, {
+    message: "Stock transferred successfully",
+    fromStock: populatedFromStock,
+    toStock: populatedToStock,
+  });
+};
+
+// ==================== جلب كل الـ Stocks (مع دعم الـ Variations) ====================
+export const getAllStocks = async (req: Request, res: Response) => {
+  const stocks = await Product_WarehouseModel.find()
+    .populate("productId", "name ar_name code price image")
+    .populate("productPriceId", "price code")
+    .populate("warehouseId", "name address")
+    .lean();
+
+  SuccessResponse(res, { stocks });
+};
+
+// ==================== جلب المنتجات اللي كميتها قليلة (مع دعم الـ Variations) ====================
+export const getLowStockProducts = async (req: Request, res: Response) => {
+  const { warehouseId } = req.query;
+
+  const filter: any = {
+    $expr: { $lte: ["$quantity", "$low_stock"] },
+  };
+
+  if (warehouseId) {
+    filter.warehouseId = warehouseId;
+  }
+
+  const lowStocks = await Product_WarehouseModel.find(filter)
+    .populate("productId", "name ar_name code price image")
+    .populate("productPriceId", "price code")
+    .populate("warehouseId", "name address")
+    .lean();
+
+  // تنسيق البيانات
+  const formattedProducts = lowStocks.map((stock: any) => ({
+    _id: stock._id,
+    product: stock.productId,
+    productVariation: stock.productPriceId,  // ✅ إضافة الـ variation
+    warehouse: stock.warehouseId,
+    currentQuantity: stock.quantity,
+    lowStockThreshold: stock.low_stock,
+    shortage: stock.low_stock - stock.quantity,
+    status: stock.quantity === 0 ? "Out of Stock" : "Low Stock",
+  }));
+
+  SuccessResponse(res, {
+    message: "Low stock products",
+    count: formattedProducts.length,
+    products: formattedProducts,
+  });
+};
+
+
+// ==================== جلب تفاصيل مخزون معين بالـ ID ====================
+export const getStockById = async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  // التحقق من أن الـ ID المبعوت بصيغة صحيحة
+  if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+    throw new BadRequest("Invalid Stock ID");
+  }
+
+  // البحث عن الستوك وعمل populate للبيانات المرتبطة
+  const stock = await Product_WarehouseModel.findById(id)
+    .populate({
+      path: "productId",
+      populate: [{ path: "categoryId" }, { path: "brandId" }], // لو حابب تجيب بيانات أكتر
+      select: "name ar_name code price image categoryId brandId", 
+    })
+    .populate("productPriceId", "price code quantity")
+    .populate("warehouseId", "name address")
+    .lean();
+
+  if (!stock) {
+    throw new NotFound("Stock not found");
+  }
+
+  // لو محتاج تجيب الـ Options الخاصة بالـ variation زي ما عملت في getWarehouseProducts
+  let variationOptions: any[] = [];
+  if (stock.productPriceId) {
+    const priceOptions = await ProductPriceOptionModel.find({
+      product_price_id: stock.productPriceId._id,
+    }).lean();
+
+    variationOptions = await Promise.all(
+      priceOptions.map(async (po: any) => {
+        if (!po.option_id) return null;
+        const option = await mongoose.model("Option").findById(po.option_id)
+          .populate("variationId", "name ar_name")
+          .lean();
+        return option;
+      })
+    );
+    variationOptions = variationOptions.filter((o) => o !== null);
+  }
+
+  SuccessResponse(res, {
+    message: "Stock details fetched successfully",
+    stock: {
+      ...stock,
+      variationOptions, // إرجاع الخيارات مع النتيجة
+    },
+  });
+};

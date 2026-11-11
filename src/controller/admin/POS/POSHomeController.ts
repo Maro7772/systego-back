@@ -1,0 +1,852 @@
+import { ProductModel } from "../../../models/schema/admin/products";
+import { CategoryModel } from "../../../models/schema/admin/category";
+import { BrandModel } from "../../../models/schema/admin/brand";
+import { CouponModel } from "../../../models/schema/admin/coupons";
+import { TaxesModel } from "../../../models/schema/admin/Taxes";
+import { DiscountModel } from "../../../models/schema/admin/Discount";
+import { WarehouseModel } from "../../../models/schema/admin/Warehouse";
+import { GiftCardModel } from "../../../models/schema/admin/POS/giftCard";
+import { PaymentMethodModel } from "../../../models/schema/admin/payment_methods";
+import {
+  ProductPriceModel,
+  ProductPriceOptionModel,
+} from "../../../models/schema/admin/product_price";
+import {
+  CustomerModel,
+  CustomerGroupModel,
+} from "../../../models/schema/admin/POS/customer";
+import { NotFound } from "../../../Errors";
+import { SuccessResponse } from "../../../utils/response";
+import { Request, Response } from "express";
+import { BankAccountModel } from "../../../models/schema/admin/Financial_Account";
+import { CurrencyModel } from "../../../models/schema/admin/Currency";
+import { get } from "axios";
+import { PandelModel } from "../../../models/schema/admin/pandels";
+import { buildProductsWithVariations } from "../../../utils/producthelper";
+import { CountryModel } from "../../../models/schema/admin/Country";
+import { CityModels } from "../../../models/schema/admin/City";
+import { CashierModel } from "../../../models/schema/admin/cashier";
+import { BadRequest } from "../../../Errors/BadRequest";
+import { Product_WarehouseModel } from "../../../models/schema/admin/Product_Warehouse";
+import { ServiceFeeModel } from "../../../models/schema/admin/ServiceFee";
+import { CashierShift } from "../../../models/schema/admin/POS/CashierShift";
+// get all category
+export const getAllCategorys = async (req: Request, res: Response) => {
+  const jwtUser = req.user as any;
+  const warehouseId = jwtUser?.warehouse_id;
+
+  if (!warehouseId) {
+    throw new BadRequest("Warehouse is not assigned to this user");
+  }
+
+  // Returns ALL categories regardless of whether they currently have any
+  // products (or any in-stock products) in this warehouse. Previously
+  // this only returned categories that already had a product with
+  // quantity > 0 in the assigned warehouse — a new or currently-empty
+  // category simply never appeared in the POS category list.
+  const category = await CategoryModel.find();
+
+  SuccessResponse(res, { message: "Category list", category });
+};
+
+// ═══════════════════════════════════════════════════════════
+// Get All Brands
+// ═══════════════════════════════════════════════════════════
+export const getAllBrands = async (req: Request, res: Response) => {
+  const jwtUser = req.user as any;
+  const warehouseId = jwtUser?.warehouse_id;
+
+  if (!warehouseId) {
+    throw new BadRequest("Warehouse is not assigned to this user");
+  }
+
+  // Same as categories — all brands, regardless of product/stock
+  // presence in this warehouse.
+  const brand = await BrandModel.find();
+
+  SuccessResponse(res, { message: "Brand list", brand });
+};
+
+// ═══════════════════════════════════════════════════════════
+// Helper: build a list of products with their variations and stock
+// ═══════════════════════════════════════════════════════════
+const buildWarehouseProductList = async (
+  productFilter: any,
+  warehouseId: any
+) => {
+  const products = await ProductModel.find(productFilter)
+    .populate("categoryId", "name ar_name")
+    .populate("brandId", "name ar_name")
+    .lean();
+
+  if (products.length === 0) return [];
+
+  const productIds = products.map((p) => p._id);
+
+  // Stock for these products, in this warehouse only. This is a left
+  // join in spirit — a product/variant with no matching row here just
+  // resolves to quantity 0 below, it isn't excluded from `products`.
+  const stocks = await Product_WarehouseModel.find({
+    productId: { $in: productIds },
+    warehouseId,
+  }).lean();
+
+  const stockByProduct: Record<string, number> = {};
+  const stockByVariant: Record<string, number> = {};
+  for (const s of stocks as any[]) {
+    if (s.productPriceId) {
+      const key = s.productPriceId.toString();
+      stockByVariant[key] = (stockByVariant[key] || 0) + s.quantity;
+    } else {
+      const key = s.productId.toString();
+      stockByProduct[key] = (stockByProduct[key] || 0) + s.quantity;
+    }
+  }
+
+  return Promise.all(
+    products.map(async (product: any) => {
+      const variations = await ProductPriceModel.find({
+        productId: product._id,
+      }).lean();
+
+      const variationIds = variations.map((v: any) => v._id);
+
+      // Join rows connecting each SKU (ProductPrice) to the Option it
+      // was built from. option_id -> Option -> variationId -> Variation
+      // (e.g. Variation "المقاس" -> Option "M"). One row per
+      // (SKU, Variation) pair — a size/color combo SKU has two rows.
+      const priceOptions = variationIds.length
+        ? await ProductPriceOptionModel.find({
+            product_price_id: { $in: variationIds },
+          })
+            .populate({
+              path: "option_id",
+              select: "name variationId",
+              populate: { path: "variationId", select: "name ar_name" },
+            })
+            .lean()
+        : [];
+
+      // Per-SKU attribute list, and the set of every option value seen
+      // for each variation name across ALL of this product's SKUs
+      // (used to build variation_attributes at the product level).
+      const attrsBySku: Record<string, { name: string; value: string }[]> = {};
+      const optionValuesByVariation: Record<string, Set<string>> = {};
+
+      for (const po of priceOptions as any[]) {
+        const option = po.option_id;
+        const variation = option?.variationId;
+        if (!option || !variation) continue;
+
+        const skuKey = po.product_price_id.toString();
+        const variationName = variation.ar_name || variation.name;
+        const optionValue = option.name;
+
+        (attrsBySku[skuKey] ??= []).push({ name: variationName, value: optionValue });
+        (optionValuesByVariation[variationName] ??= new Set()).add(optionValue);
+      }
+
+      const formattedVariations = variations.map((v: any) => {
+        const attrs = attrsBySku[v._id.toString()] || [];
+        const attributes: Record<string, string> = {};
+        for (const a of attrs) attributes[a.name] = a.value;
+
+        return {
+          _id: v._id,
+          price: v.price,
+          code: v.code,
+          gallery: v.gallery || [],
+          // Per-variant quantity, scoped to THIS warehouse only.
+          quantity: stockByVariant[v._id.toString()] ?? 0,
+          attributes,
+        };
+      });
+
+      // variation_attributes: one entry per distinct variation name
+      // used by this product, listing every option value that shows
+      // up across its SKUs — not just the options on a single SKU.
+      const variation_attributes = Object.entries(optionValuesByVariation).map(
+        ([name, values]) => ({
+          name,
+          options: Array.from(values),
+        })
+      );
+
+      // different_price: true only when two or more variations
+      // actually carry different prices; a uniform-price variant set
+      // (or a simple product) is not "different".
+      const distinctPrices = new Set(formattedVariations.map((v) => v.price));
+      const different_price = distinctPrices.size > 1;
+
+      return {
+        _id: product._id,
+        name: product.name,
+        ar_name: product.ar_name,
+        price: product.price,
+        image: product.image,
+        different_price,
+        variation_attributes,
+        variations: formattedVariations,
+        // Stock scoped to the selected warehouse (0 if not present).
+        quantity: stockByProduct[product._id.toString()] ?? 0,
+      };
+    })
+  );
+};
+
+// ═══════════════════════════════════════════════════════════
+// Get Products By Category (بالـ Warehouse)
+// ═══════════════════════════════════════════════════════════
+export const getProductsByCategory = async (req: Request, res: Response) => {
+  const jwtUser = req.user as any;
+  const warehouseId = jwtUser?.warehouse_id;
+  const { categoryId } = req.params;
+
+  if (!warehouseId) {
+    throw new BadRequest("Warehouse is not assigned to this user");
+  }
+
+  const category = await CategoryModel.findById(categoryId);
+  if (!category) throw new NotFound("Category not found");
+
+  // ✅ categoryId هو Array عشان كده نستخدم $in
+  const result = await buildWarehouseProductList(
+    { categoryId: { $in: [categoryId] } },
+    warehouseId
+  );
+
+  SuccessResponse(res, {
+    message: "Products list by category",
+    products: result,
+  });
+};
+
+// ═══════════════════════════════════════════════════════════
+// Get Products By Brand (بالـ Warehouse)
+// ═══════════════════════════════════════════════════════════
+export const getProductsByBrand = async (req: Request, res: Response) => {
+  const jwtUser = req.user as any;
+  const warehouseId = jwtUser?.warehouse_id;
+  const { brandId } = req.params;
+
+  if (!warehouseId) {
+    throw new BadRequest("Warehouse is not assigned to this user");
+  }
+
+  const brand = await BrandModel.findById(brandId);
+  if (!brand) throw new NotFound("Brand not found");
+
+  const result = await buildWarehouseProductList({ brandId }, warehouseId);
+
+  SuccessResponse(res, {
+    message: "Products list by brand",
+    products: result,
+  });
+};
+
+// ═══════════════════════════════════════════════════════════
+// Get Featured Products (بالـ Warehouse)
+// ═══════════════════════════════════════════════════════════
+export const getFeaturedProducts = async (req: Request, res: Response) => {
+  const jwtUser = req.user as any;
+  const warehouseId = jwtUser?.warehouse_id;
+
+  if (!warehouseId) {
+    throw new BadRequest("Warehouse is not assigned to this user");
+  }
+
+  const result = await buildWarehouseProductList(
+    { is_featured: true },
+    warehouseId
+  );
+
+  SuccessResponse(res, {
+    message: "Featured products",
+    products: result,
+  });
+};
+
+// get all selections
+export const getAllSelections = async (req: Request, res: Response) => {
+  const warehouseId = req.user?.warehouse_id;
+  const warehouses = await WarehouseModel.find(
+    warehouseId ? { _id: warehouseId } : {}
+  ).select("name");
+  const accounts = await BankAccountModel.find({
+    in_POS: true,
+    status: true,
+    ...(warehouseId ? { warehouseId } : {}),
+  })
+    .select("name ar_name balance warehouseId")
+    .sort({ name: 1 });
+  const taxes = await TaxesModel.find().select("name status amount type");
+  const discounts = await DiscountModel.find().select(
+    "name status amount type"
+  );
+  const coupons = await CouponModel.find().select(
+    "coupon_code amount type minimum_amount quantity available expired_date"
+  );
+  const giftCards = await GiftCardModel.find().select("code amount");
+  const paymentMethods = await PaymentMethodModel.find({
+    isActive: true,
+  }).select("name");
+  const customers = await CustomerModel.find().select(
+    "name phone_number email address"
+  );
+  const customerGroups = await CustomerGroupModel.find().select("name ");
+  const dueCustomers = await CustomerModel.find({ is_Due: true }).select(
+    "name phone_number email address amount_Due"
+  );
+  const currency = await CurrencyModel.find({ isdefault: true }).select(
+    "name  ar_name,amount"
+  );
+  const countries = await CountryModel.find().select("name ar_name").populate({
+    path: "cities",
+    select: "name ar_name shipingCost", // الحقول اللي ترجع من الـ City
+  });
+  const sevicefees = await ServiceFeeModel.find({
+    status: true,
+    module: "pos",
+    $or: warehouseId
+      ? [{ warehouseId }, { warehouseId: null }]
+      : [{ warehouseId: null }],
+  }).select("title amount type module warehouseId");
+
+  SuccessResponse(res, {
+    message: "Selections list",
+    dueCustomers,
+    countries,
+    warehouses,
+    sevicefees,
+    currency,
+    accounts,
+    taxes,
+    discounts,
+    coupons,
+    giftCards,
+    paymentMethods,
+    customers,
+    customerGroups,
+  });
+};
+
+export const getActiveBundles = async (req: Request, res: Response) => {
+  const currentDate = new Date();
+  const jwtUser = req.user as any;
+  const warehouseId = jwtUser?.warehouse_id;
+
+  if (!warehouseId) {
+    throw new BadRequest("Warehouse is not assigned to this user");
+  }
+
+  const bundles = await PandelModel.find({
+    status: true,
+    startdate: { $lte: currentDate },
+    enddate: { $gte: currentDate },
+    $or: [
+      { all_warehouses: true },
+      { all_warehouses: { $exists: false } },
+      { warehouse_ids: String(warehouseId) },
+    ],
+  }).lean();
+
+  const bundlesWithDetails = await Promise.all(
+    bundles.map(async (bundle) => {
+      let originalPrice = 0;
+
+      const productsDetails = await Promise.all(
+        (bundle.products || []).map(async (p: any) => {
+          // جلب المنتج
+          const product = await ProductModel.findById(p.productId)
+            .select("name ar_name image price")
+            .lean();
+
+          if (!product) return null;
+
+          // جلب كل الـ Variations للمنتج ده
+          const allVariations = await ProductPriceModel.find({
+            productId: p.productId,
+          })
+            .select("price code quantity cost")
+            .lean();
+
+          // جلب الـ Options لكل Variation
+          const variationsWithOptions = await Promise.all(
+            allVariations.map(async (v: any) => {
+              const options = await ProductPriceOptionModel.find({
+                product_price_id: v._id,
+              })
+                .populate("option_id", "name ar_name")
+                .lean();
+
+              return {
+                _id: v._id,
+                price: v.price,
+                code: v.code,
+                quantity: v.quantity,
+                options: options.map((o: any) => o.option_id),
+              };
+            })
+          );
+
+          const hasVariations = variationsWithOptions.length > 0;
+          const isVariationFixed = !!p.productPriceId;
+
+          let selectedVariation = null;
+          let productPrice = product.price || 0;
+
+          // لو الـ Variation محدد من الأدمن
+          if (isVariationFixed && p.productPriceId) {
+            const fixedVariation = variationsWithOptions.find(
+              (v: any) => v._id.toString() === p.productPriceId.toString()
+            );
+            if (fixedVariation) {
+              selectedVariation = fixedVariation;
+              productPrice = fixedVariation.price || product.price || 0;
+            }
+          }
+
+          // حساب السعر الأصلي
+          originalPrice += productPrice * (p.quantity || 1);
+
+          return {
+            productId: p.productId,
+            product: product,
+            quantity: p.quantity || 1,
+
+            // معلومات الـ Variations
+            hasVariations: hasVariations,
+            isVariationFixed: isVariationFixed,
+            requiresSelection: hasVariations && !isVariationFixed,
+
+            // لو محدد من الأدمن
+            selectedVariation: selectedVariation,
+            productPriceId: p.productPriceId || null,
+
+            // لو مفتوح للكاشير
+            availableVariations: !isVariationFixed ? variationsWithOptions : [],
+          };
+        })
+      );
+
+      const validProducts = productsDetails.filter((p) => p !== null);
+
+      const savings = originalPrice - bundle.price;
+      const savingsPercentage =
+        originalPrice > 0 ? Math.round((savings / originalPrice) * 100) : 0;
+
+      // هل الـ Bundle يحتاج اختيار من الكاشير؟
+      const requiresVariationSelection = validProducts.some(
+        (p: any) => p?.requiresSelection
+      );
+
+      return {
+        _id: bundle._id,
+        name: bundle.name,
+        images: bundle.images,
+        price: bundle.price,
+        originalPrice: originalPrice,
+        savings: savings > 0 ? savings : 0,
+        savingsPercentage: savingsPercentage > 0 ? savingsPercentage : 0,
+        startdate: bundle.startdate,
+        enddate: bundle.enddate,
+
+        // ✅ الجديد
+        requiresVariationSelection: requiresVariationSelection,
+        products: validProducts,
+      };
+    })
+  );
+
+  return SuccessResponse(res, {
+    message: "Active bundles",
+    count: bundlesWithDetails.length,
+    bundles: bundlesWithDetails,
+  });
+};
+
+export const getCashiers = async (req: Request, res: Response) => {
+  const warehouseId = req.user?.warehouse_id;
+
+  if (!warehouseId) {
+    throw new NotFound("Warehouse ID is required");
+  }
+
+  const cashiers = await CashierModel.find({
+    warehouse_id: warehouseId,
+    status: true,
+    cashier_active: false, // ✅ المتاحين فقط
+  })
+    .select("_id name ar_name cashier_active")
+    .lean();
+
+  SuccessResponse(res, {
+    cashiers,
+  });
+};
+
+export const selectCashier = async (req: Request, res: Response) => {
+  const warehouseId = (req.user as any)?.warehouse_id;
+
+  if (!warehouseId) {
+    throw new NotFound("Warehouse ID is required");
+  }
+
+  const { cashier_id } = req.body;
+  if (!cashier_id) {
+    throw new BadRequest("Cashier ID is required");
+  }
+
+  // ✅ check من الـ shift (source of truth)
+  const busyShift = await CashierShift.findOne({
+    cashier_id,
+    status: "open",
+  });
+
+  if (busyShift) {
+    throw new BadRequest("Cashier already in use");
+  }
+
+  const cashier = await CashierModel.findOne({
+    _id: cashier_id,
+    warehouse_id: warehouseId,
+    status: true,
+  })
+    .select("_id name ar_name cashier_active")
+    .lean();
+
+  if (!cashier) {
+    throw new NotFound("Cashier not found");
+  }
+
+  const financialAccounts = await BankAccountModel.find({
+    warehouseId: warehouseId,
+    status: true,
+    in_POS: true,
+  })
+    .select("_id name ar_name image balance")
+    .sort({ name: 1 })
+    .lean();
+
+  return SuccessResponse(res, {
+    message: "Cashier selected successfully",
+    cashier,
+    financialAccounts,
+  });
+};
+
+// 1. Warehouses
+// كل الفروع (warehouses) تظهر للمستخدم — مش بس الفرع المخصّص له،
+// عشان التحويل بين الفروع وأي اختيار فرع في الـ POS يبقى كامل.
+export const getWarehouses = async (req: Request, res: Response) => {
+  const warehouseId = req.user?.warehouse_id;
+  const warehouses = await WarehouseModel.find()
+    .select("name")
+    .sort({ name: 1 });
+
+  // الفرع المخصّص للمستخدم أول القائمة (لو موجود)
+  const ordered = warehouseId
+    ? warehouses.sort((a, b) =>
+        String(a._id) === String(warehouseId)
+          ? -1
+          : String(b._id) === String(warehouseId)
+            ? 1
+            : 0,
+      )
+    : warehouses;
+
+  SuccessResponse(res, { message: "Warehouses list", data: ordered });
+};
+
+// 2. Bank Accounts
+export const getAccounts = async (req: Request, res: Response) => {
+  const warehouseId = req.user?.warehouse_id;
+  const accounts = await BankAccountModel.find({
+    in_POS: true,
+    status: true,
+    ...(warehouseId ? { warehouseId } : {}),
+  })
+    .select("name ar_name balance warehouseId")
+    .sort({ name: 1 });
+  SuccessResponse(res, { message: "Accounts list", data: accounts });
+};
+
+// 3. Taxes
+export const getTaxes = async (req: Request, res: Response) => {
+  const taxes = await TaxesModel.find().select("name status amount type");
+  SuccessResponse(res, { message: "Taxes list", data: taxes });
+};
+
+// 4. Discounts
+export const getDiscounts = async (req: Request, res: Response) => {
+  const warehouseId = req.user?.warehouse_id;
+  const discounts = await DiscountModel.find({
+    status: true,
+    applyIn: "POS",
+    $or: [{ all_warehouses: true }, { warehouse_ids: warehouseId }],
+  }).select("name status amount type");
+
+  SuccessResponse(res, { message: "Discounts list", data: discounts });
+};
+
+// 5. Coupons
+export const getCoupons = async (req: Request, res: Response) => {
+  const coupons = await CouponModel.find().select(
+    "coupon_code amount type minimum_amount quantity available expired_date"
+  );
+  SuccessResponse(res, { message: "Coupons list", data: coupons });
+};
+
+// 6. Gift Cards
+export const getGiftCards = async (req: Request, res: Response) => {
+  const giftCards = await GiftCardModel.find().select("code amount");
+  SuccessResponse(res, { message: "Gift Cards list", data: giftCards });
+};
+
+// 7. Payment Methods
+export const getPaymentMethods = async (req: Request, res: Response) => {
+  const paymentMethods = await PaymentMethodModel.find({
+    isActive: true,
+  }).select("name");
+  SuccessResponse(res, {
+    message: "Payment Methods list",
+    data: paymentMethods,
+  });
+};
+
+// 8. Customers
+export const getCustomers = async (req: Request, res: Response) => {
+  const search = String(req.query.search || "").trim();
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+
+  const filter: any = {};
+
+  if (search) {
+    filter.$or = [
+      { name: { $regex: search, $options: "i" } },
+      { phone_number: { $regex: search, $options: "i" } },
+      { email: { $regex: search, $options: "i" } },
+    ];
+  }
+
+  const customers = await CustomerModel.find(filter)
+    .select("name phone_number email address is_Due amount_Due")
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .lean();
+
+  SuccessResponse(res, { message: "Customers list", data: customers });
+};
+
+// 9. Customer Groups
+export const getCustomerGroups = async (req: Request, res: Response) => {
+  const customerGroups = await CustomerGroupModel.find().select("name");
+  SuccessResponse(res, {
+    message: "Customer Groups list",
+    data: customerGroups,
+  });
+};
+
+// 10. Due Customers
+export const getDueCustomers = async (req: Request, res: Response) => {
+  const dueCustomers = await CustomerModel.find({ is_Due: true }).select(
+    "name phone_number email address amount_Due"
+  );
+  SuccessResponse(res, { message: "Due Customers list", data: dueCustomers });
+};
+
+// 11. Currency
+export const getCurrency = async (req: Request, res: Response) => {
+  // تم تصحيح المسافات في الـ select لتجنب أي أخطاء
+  const currency = await CurrencyModel.find({ isdefault: true }).select(
+    "name ar_name amount"
+  );
+  SuccessResponse(res, { message: "Currency list", data: currency });
+};
+
+// 12. Countries and Cities
+export const getCountries = async (req: Request, res: Response) => {
+  const countries = await CountryModel.find().select("name ar_name").populate({
+    path: "cities",
+    select: "name ar_name shipingCost", // الحقول اللي ترجع من الـ City
+  });
+  SuccessResponse(res, { message: "Countries list", data: countries });
+};
+
+// 13. Service Fees
+export const getServiceFees = async (req: Request, res: Response) => {
+  const warehouseId = req.user?.warehouse_id;
+  const serviceFees = await ServiceFeeModel.find({
+    status: true,
+    module: "pos",
+    $or: warehouseId
+      ? [{ warehouseId }, { warehouseId: null }]
+      : [{ warehouseId: null }],
+  }).select("title amount type module warehouseId");
+  SuccessResponse(res, { message: "Service fees list", data: serviceFees });
+};
+
+// Get product info + quantity per warehouse, broken down per variation
+export const getProductWarehouseStock = async (req: Request, res: Response) => {
+  const { productId } = req.params;
+
+  if (!productId) {
+    throw new BadRequest("productId is required");
+  }
+
+  const product = await ProductModel.findById(productId).lean();
+  if (!product) {
+    throw new BadRequest("Product not found");
+  }
+
+  // All of this product's variants — independent of whether they have
+  // any stock rows yet. Used below to backfill variants that have zero
+  // stock (or no stock row at all) in a given warehouse.
+  const allVariations = await ProductPriceModel.find({ productId }).lean();
+
+  const stockRows = await Product_WarehouseModel.find({ productId })
+    .populate("warehouseId", "name address")
+    .populate("productPriceId", "code price")
+    .lean();
+
+  // Pull every variant's option -> variation labels in one populate chain.
+  // Sourced from allVariations (not just stockRows) so a variant with no
+  // stock row anywhere still gets its labels.
+  const productPriceIds = allVariations.map((v: any) => String(v._id));
+
+  const priceOptions = productPriceIds.length
+    ? await ProductPriceOptionModel.find({
+        product_price_id: { $in: productPriceIds },
+      })
+        .populate({
+          path: "option_id",
+          select: "name variationId",
+          populate: { path: "variationId", select: "name" },
+        })
+        .lean()
+    : [];
+
+  // Group option labels by productPriceId: e.g. "priceId123" -> [{Color: Red}]
+  const variantLabelsMap = new Map<
+    string,
+    { variationName: string; optionName: string }[]
+  >();
+
+  for (const po of priceOptions as any[]) {
+    const ppKey = String(po.product_price_id);
+    const opt = po.option_id;
+    if (!opt || !opt.variationId) continue;
+
+    const entry = {
+      variationName: opt.variationId.name,
+      optionName: opt.name,
+    };
+
+    if (!variantLabelsMap.has(ppKey)) variantLabelsMap.set(ppKey, []);
+    variantLabelsMap.get(ppKey)!.push(entry);
+  }
+
+  // productPriceId -> {code, price} for variants, sourced from
+  // allVariations so backfilled entries (no stock row) still have it.
+  const priceInfoByVariant = new Map(
+    allVariations.map((v: any) => [
+      String(v._id),
+      { code: v.code ?? null, price: v.price ?? null },
+    ])
+  );
+
+  // ── Group stock rows by warehouse, splitting base product vs. variants ──
+  const byWarehouse = new Map<string, any>();
+
+  const getOrCreateWarehouseEntry = (whKey: string, wh: any) => {
+    if (!byWarehouse.has(whKey)) {
+      byWarehouse.set(whKey, {
+        warehouseId: wh?._id ?? whKey,
+        warehouseName: wh?.name ?? null,
+        warehouseAddress: wh?.address ?? null,
+        totalQuantity: 0,
+        base: null,
+        variations: [] as any[],
+        _variantsSeen: new Set<string>(), // internal bookkeeping, stripped below
+      });
+    }
+    return byWarehouse.get(whKey);
+  };
+
+  // 1. Seed with all warehouses in the system so even zero-stock warehouses are included
+  const allWarehouses = await WarehouseModel.find({}, "name address").lean();
+  for (const wh of allWarehouses as any[]) {
+    const whKey = String(wh._id);
+    getOrCreateWarehouseEntry(whKey, wh);
+  }
+
+  for (const row of stockRows as any[]) {
+    const wh = row.warehouseId; // already populated: { _id, name, address }
+    const whKey = String(wh?._id ?? row.warehouseId);
+    const entry = getOrCreateWarehouseEntry(whKey, wh);
+
+    entry.totalQuantity += row.quantity ?? 0;
+
+    if (!row.productPriceId) {
+      entry.base = {
+        quantity: row.quantity ?? 0,
+        low_stock: row.low_stock ?? null,
+      };
+    } else {
+      const priceDoc = row.productPriceId; // already populated: { _id, code, price }
+      const ppKey = String(priceDoc._id);
+      entry._variantsSeen.add(ppKey);
+
+      entry.variations.push({
+        productPriceId: priceDoc._id,
+        code: priceDoc.code ?? null,
+        price: priceDoc.price ?? null,
+        quantity: row.quantity ?? 0,
+        low_stock: row.low_stock ?? null,
+        options: variantLabelsMap.get(ppKey) ?? [],
+      });
+    }
+  }
+
+  // Backfill:
+  // 1. For variant products: any variant with no stock row gets a zero-quantity entry.
+  if (allVariations.length > 0) {
+    for (const entry of byWarehouse.values()) {
+      for (const v of allVariations as any[]) {
+        const ppKey = String(v._id);
+        if (entry._variantsSeen.has(ppKey)) continue;
+
+        const priceInfo = priceInfoByVariant.get(ppKey);
+        entry.variations.push({
+          productPriceId: v._id,
+          code: priceInfo?.code ?? null,
+          price: priceInfo?.price ?? null,
+          quantity: 0,
+          low_stock: v.low_stock ?? product.low_stock ?? null,
+          options: variantLabelsMap.get(ppKey) ?? [],
+        });
+      }
+    }
+  } else {
+    // 2. For non-variant products: ensure any warehouse with no stock row gets a zero-quantity base entry
+    for (const entry of byWarehouse.values()) {
+      if (!entry.base) {
+        entry.base = {
+          quantity: 0,
+          low_stock: product.low_stock ?? null,
+        };
+      }
+    }
+  }
+
+  const warehouseStock = Array.from(byWarehouse.values()).map((entry) => {
+    const { _variantsSeen, ...rest } = entry;
+    return rest;
+  });
+
+  SuccessResponse(res, {
+    message: "Product warehouse stock fetched successfully",
+    product,
+    warehouseStock,
+  });
+};

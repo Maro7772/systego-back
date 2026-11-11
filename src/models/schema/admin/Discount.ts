@@ -1,0 +1,26 @@
+import mongoose, { Schema } from "mongoose";
+
+const DiscountSchema = new Schema(
+  {
+    name: { type: String, required: true, unique: true },
+    ar_name: { type: String, required: true },
+    amount: { type: Number, required: true, min: 0 },
+    type: { type: String, enum: ["percentage", "fixed"], required: true },
+    status: { type: Boolean, default: true },
+    applyIn: {
+      type: String,
+      enum: ["POS", "E-commerce"],
+      default: "E-commerce",
+    },
+    all_warehouses: { type: Boolean, default: true },
+    warehouse_ids: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Warehouse",
+      },
+    ],
+  },
+  { timestamps: true }
+);
+
+export const DiscountModel = mongoose.model("Discount", DiscountSchema);

@@ -1,0 +1,273 @@
+import {Request, Response} from 'express';
+import { CashierShift } from '../../models/schema/admin/POS/CashierShift';
+import { ProductSalesModel, SaleModel } from '../../models/schema/admin/POS/Sale';
+import { SuccessResponse } from '../../utils/response';
+import { NotFound } from '../../Errors';
+import { BadRequest } from '../../Errors/BadRequest';
+import { UserModel } from '../../models/schema/admin/User';
+import { ExpenseModel } from '../../models/schema/admin/POS/expenses';
+import mongoose from 'mongoose';
+import { CashierModel } from '../../models/schema/admin/cashier';
+import { ReturnModel } from '../../models/schema/admin/POS/ReturnSale';
+import {
+    resolveBranchIdsForUser,
+    resolvePosIds,
+    resolveBranchCashierIds,
+} from '../../utils/reportFilters';
+
+
+export const getAllCashierShifts = async (req: Request, res: Response) => {
+    const { status, cashierman_id, cashier_id } = req.query as any;
+
+    // فلتر الفروع (الفرع = Warehouse)
+    const branchIds = resolveBranchIdsForUser(req.query, req.user);
+    // فلتر نقاط البيع (POS = Cashier)
+    const posIds = resolvePosIds(req.query);
+
+    // الشيفت مربوط بالـ POS عن طريق cashier_id
+    let cashierFilterIds: mongoose.Types.ObjectId[] | null = null;
+    if (posIds.length > 0) cashierFilterIds = posIds;
+
+    if (branchIds.length > 0) {
+        const branchCashierIds = await resolveBranchCashierIds(branchIds);
+        cashierFilterIds = cashierFilterIds
+            ? cashierFilterIds.filter((id) =>
+                  branchCashierIds.some((branchCashierId) => branchCashierId.equals(id))
+              )
+            : branchCashierIds;
+    }
+
+    const filter: any = {};
+    if (status) filter.status = status;
+    if (cashierman_id) filter.cashierman_id = cashierman_id;
+    if (cashierFilterIds) {
+        filter.cashier_id = { $in: cashierFilterIds };
+    } else if (cashier_id) {
+        filter.cashier_id = cashier_id;
+    }
+
+    const shifts = await CashierShift.find(filter)
+        .populate("cashierman_id", "username email role")
+        .populate("cashier_id", "name code")
+        .sort({ start_time: -1 })
+        .lean();
+
+    // ✅ حساب القيم لكل شيفت
+    const shiftsWithTotals = await Promise.all(
+        shifts.map(async (shift: any) => {
+            const shiftStartTime = new Date(shift.start_time || Date.now());
+
+            // مبيعات الشيفت
+            const sales = await SaleModel.find({
+                shift_id: shift._id,
+                order_pending: 0,
+                createdAt: { $gte: shiftStartTime },
+            })
+                .select("grand_total")
+                .lean();
+
+            // مصروفات الشيفت
+            const expenses = await ExpenseModel.find({
+                shift_id: shift._id,
+                createdAt: { $gte: shiftStartTime },
+            })
+                .select("amount")
+                .lean();
+
+            // مرتجعات الشيفت
+            const returns = await ReturnModel.find({
+                shift_id: shift._id,
+                createdAt: { $gte: shiftStartTime },
+            })
+                .select("total_amount")
+                .lean();
+
+            const totalSales = sales.reduce((sum, s: any) => sum + (s.grand_total || 0), 0);
+            const totalExpenses = expenses.reduce((sum, e: any) => sum + (e.amount || 0), 0);
+            const totalReturns = returns.reduce((sum, r: any) => sum + (r.total_amount || 0), 0);
+            const netCashInDrawer = totalSales - totalExpenses - totalReturns;
+
+            return {
+                ...shift,
+                total_sale_amount: totalSales,
+                total_expenses: totalExpenses,
+                total_returns: totalReturns,
+                net_cash_in_drawer: netCashInDrawer,
+                orders_count: sales.length,
+                returns_count: returns.length,
+            };
+        })
+    );
+
+    return SuccessResponse(res, {
+        message: "Cashier shifts fetched successfully",
+        shifts: shiftsWithTotals,
+    });
+};
+
+
+export const getCashierShiftDetails = async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+    throw new BadRequest("Invalid shift id");
+  }
+
+  // 1) هات الشيفت مع بيانات اليوزر و الكاشير
+  const shift = await CashierShift.findById(id)
+    .populate("cashierman_id", "username email role")
+    .populate("cashier_id", "name code")
+    .lean();
+
+  if (!shift) {
+    throw new NotFound("Cashier shift not found");
+  }
+
+  // ✅ حساب الـ filterFromDate
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  
+  const shiftStartTime = new Date(shift.start_time || Date.now());
+  const filterFromDate = shiftStartTime > todayStart ? shiftStartTime : todayStart;
+
+  // 2) كل المبيعات في الشيفت ده
+  const sales = await SaleModel.find({
+    shift_id: shift._id,
+    order_pending: 0,
+    createdAt: { $gte: shiftStartTime },
+  })
+    .populate("customer_id", "name email phone_number")
+    .populate("warehouse_id", "name location")
+    .populate("order_tax", "name amount type")
+    .populate("order_discount", "name amount type")
+    .populate("gift_card_id", "code amount")
+    .lean();
+
+  const saleIds = sales.map((s) => s._id);
+
+  let salesWithItems = sales;
+  if (saleIds.length > 0) {
+    const items = await ProductSalesModel.find({
+      sale_id: { $in: saleIds },
+    })
+      .populate("product_id", "name ar_name image price")
+      .populate("product_price_id", "price code")
+      .populate("bundle_id", "name price")
+      .lean();
+
+    const itemsBySaleId: Record<string, any[]> = {};
+    for (const item of items) {
+      const key = item.sale_id.toString();
+      if (!itemsBySaleId[key]) itemsBySaleId[key] = [];
+      itemsBySaleId[key].push(item);
+    }
+
+    salesWithItems = sales.map((s) => ({
+      ...s,
+      items: itemsBySaleId[s._id.toString()] || [],
+    }));
+  }
+
+  // 4) مصروفات الشيفت
+  const expenses = await ExpenseModel.find({
+    shift_id: shift._id,
+    createdAt: { $gte: shiftStartTime },
+  })
+    .populate("Category_id", "name")
+    .populate("financial_accountId", "name")
+    .lean();
+
+  // 5) Summary محسوب من الداتا
+  const totalSales = sales.reduce(
+    (sum, s: any) => sum + (s.grand_total || 0),
+    0
+  );
+  const totalExpenses = expenses.reduce(
+    (sum, e: any) => sum + (e.amount || 0),
+    0
+  );
+  const netCashInDrawer = totalSales - totalExpenses;
+
+  const summary = {
+    totalSales,
+    totalExpenses,
+    netCashInDrawer,
+    ordersCount: sales.length,
+  };
+
+  // ✅ رجع الشيفت بالقيم المحسوبة
+  return SuccessResponse(res, {
+    message: "Cashier shift details fetched successfully",
+    shift: {
+      ...shift,
+      total_sale_amount: totalSales,
+      total_expenses: totalExpenses,
+      net_cash_in_drawer: netCashInDrawer,
+    },
+    summary,
+    sales: salesWithItems,
+    expenses,
+  });
+};
+
+export const closeCashierShift = async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  // 1) البحث عن الشيفت
+  const shift = await CashierShift.findById(id);
+
+  if (!shift) {
+    throw new NotFound("Cashier shift not found");
+  }
+
+  // 2) التأكد أن الشيفت مفتوح بالفعل وليس مغلقاً مسبقاً
+  if (shift.status === "closed") {
+    throw new BadRequest("This shift is already closed");
+  }
+
+  const shiftStartTime = new Date(shift.start_time || shift.createdAt);
+
+  // 3) حساب إجمالي المبيعات التي تمت خلال هذا الشيفت
+  const sales = await SaleModel.find({
+    shift_id: shift._id,
+    order_pending: 0,
+    createdAt: { $gte: shiftStartTime },
+  })
+    .select("grand_total")
+    .lean();
+
+  const totalSales = sales.reduce(
+    (sum, s: any) => sum + (s.grand_total || 0),
+    0
+  );
+
+  // 4) حساب إجمالي المصروفات التي تمت خلال هذا الشيفت
+  const expenses = await ExpenseModel.find({
+    shift_id: shift._id,
+    createdAt: { $gte: shiftStartTime },
+  })
+    .select("amount")
+    .lean();
+
+  const totalExpenses = expenses.reduce(
+    (sum, e: any) => sum + (e.amount || 0),
+    0
+  );
+
+  const netCashInDrawer = totalSales - totalExpenses;
+
+  // 5) تحديث بيانات الشيفت وإغلاقه
+  shift.status = "closed";
+  shift.end_time = new Date(); // تسجيل وقت الإغلاق
+  shift.total_sale_amount = totalSales; // حفظ المبيعات النهائية
+  shift.total_expenses = totalExpenses; // حفظ المصروفات النهائية
+  shift.net_cash_in_drawer = netCashInDrawer; // حفظ صافي الدرج النهائي
+
+  await shift.save();
+  await CashierModel.findByIdAndUpdate(shift.cashier_id, { cashier_active: false });
+  // إرجاع الرد بنجاح 
+  return SuccessResponse(res, {
+    message: "Cashier shift closed successfully",
+    shift,
+  });
+};

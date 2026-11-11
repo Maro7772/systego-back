@@ -1,0 +1,48 @@
+import { Router } from "express";
+import authRouter from "./auth";
+import categoryRouter from "./Categoey";
+import productRouter from "./products";
+import brandRouter from "./brand";
+import addressRouter from "./Address";
+import cartRouter from "./Cart";
+import orderRouter from "./Order";
+import bannerRouter from "./banner";
+import wishlistRouter from "./wishlist";
+import paymentMethodRouter from "./paymentmethod";
+import tenantInfoRouter from "../admin/tenantInfo";
+import orderTypeRouter from "./ordertype";
+import warehouseRouter from "./Warehouse";
+import storeSettingsRoutes from "./storeSettings";
+import ecommerceDataRouter from "../admin/ecommerceData";
+import userShippingRoutes from "./shipping";
+import installmentRouter from "./installments";
+
+import bundleRouter from "./bundle";
+
+const userRoute = Router();
+
+userRoute.use("/offer", bundleRouter);
+
+userRoute.use("/tenant-info", tenantInfoRouter);
+userRoute.use("/banner", bannerRouter);
+
+userRoute.use("/auth", authRouter);
+userRoute.use("/category", categoryRouter);
+userRoute.use("/product", productRouter);
+userRoute.use("/brand", brandRouter);
+userRoute.use("/wishlist", wishlistRouter);
+
+userRoute.use("/payment-methods", paymentMethodRouter);
+
+userRoute.use("/address", addressRouter);
+userRoute.use("/cart", cartRouter);
+userRoute.use("/order", orderRouter);
+userRoute.use("/installments", installmentRouter);
+userRoute.use("/order-type", orderTypeRouter);
+userRoute.use("/warehouse", warehouseRouter);
+
+userRoute.use("/store-settings", storeSettingsRoutes);
+userRoute.use("/ecommerce-data", ecommerceDataRouter);
+userRoute.use("/shipping", userShippingRoutes);
+
+export default userRoute;

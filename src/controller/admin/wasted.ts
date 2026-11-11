@@ -1,0 +1,435 @@
+import { Request, Response } from "express";
+import mongoose from "mongoose";
+import { WastedModel } from "../../models/schema/admin/wasted";
+import { Product_WarehouseModel } from "../../models/schema/admin/Product_Warehouse";
+import { ProductModel } from "../../models/schema/admin/products";
+import { BadRequest } from "../../Errors/BadRequest";
+import { SuccessResponse } from "../../utils/response";
+import { ForbiddenError } from "../../Errors";
+import { ProductPriceModel } from "../../models/schema/admin/product_price";
+
+// ==================== Create Wasted Entry ====================
+export const createWasted = async (req: Request, res: Response) => {
+  try {
+    const {
+      productId,
+      productPriceId = null,
+      warehouseId,
+      quantity,
+      reason,
+      note,
+      isApproved
+    } = req.body;
+    const jwtUser = req.user as any;
+    const userId = jwtUser?.id || jwtUser?._id;
+    console.log("createWasted request body:", req.body);
+    if (!productId || !warehouseId || !quantity || !reason) {
+      throw new BadRequest(
+        "productId, warehouseId, quantity, and reason are required"
+      );
+    }
+    if (quantity <= 0) {
+      throw new BadRequest("quantity must be greater than 0");
+    }
+
+    const product = await ProductModel.findOneAndUpdate(
+      { _id: productId },
+      { $inc: { quantity: -quantity } },
+      { new: true }
+    );
+    if (!product) {
+      throw new BadRequest("Product not found");
+    }
+
+    const productPrice = await ProductPriceModel.findOneAndUpdate(
+      { _id: productPriceId },
+      { $inc: { quantity: -quantity } },
+      { new: true }
+    );
+
+    if (!productPrice && productPriceId) {
+      throw new BadRequest("Product price not found");
+    }
+
+    // 1. Atomically decrement stock, guarded so it can't go negative
+    const stockDoc = await Product_WarehouseModel.findOneAndUpdate(
+      {
+        productId,
+        productPriceId,
+        warehouseId,
+        quantity: { $gte: quantity },
+      },
+      { $inc: { quantity: -quantity } },
+      { new: true }
+    );
+
+    if (!stockDoc) {
+      throw new BadRequest(
+        "Not enough stock in this warehouse to waste this quantity"
+      );
+    }
+
+    // 3. Create the Wasted record
+    let wastedDoc;
+    try {
+      wastedDoc = await WastedModel.create({
+        productId,
+        productPriceId,
+        warehouseId,
+        quantity,
+        reason,
+        note,
+        userId,
+        isApproved: isApproved !== undefined ? isApproved : false,
+      });
+    } catch (err) {
+      // 4. Rollback stock decrement if the Wasted doc failed to save
+      await Product_WarehouseModel.findOneAndUpdate(
+        { productId, productPriceId, warehouseId },
+        { $inc: { quantity: quantity } }
+      );
+      throw err;
+    }
+    SuccessResponse(res, { message: "Wasted entry created", wastedDoc });
+  } catch (error: any) {
+    console.error("createWasted error:", error);
+    throw new ForbiddenError(error.message || "Failed to create wasted entry");
+  }
+};
+
+// ==================== Get All Wasted (with filters) ====================
+export const getAllWasted = async (req: Request, res: Response) => {
+  try {
+    const {
+      warehouseId,
+      productId,
+      reason,
+      from,
+      to,
+      page = 1,
+      limit = 20,
+    } = req.query as Record<string, string>;
+
+    const filter: any = {};
+    if (warehouseId) filter.warehouseId = warehouseId;
+    if (productId) filter.productId = productId;
+    if (reason) filter.reason = reason;
+    if (from || to) {
+      filter.createdAt = {};
+      if (from) filter.createdAt.$gte = new Date(from);
+      if (to) {
+        const toDate = new Date(to);
+        if (typeof to === "string" && to.length === 10) {
+          toDate.setHours(23, 59, 59, 999);
+        }
+        filter.createdAt.$lte = toDate;
+      }
+    }
+
+    const skip = (Number(page) - 1) * Number(limit);
+
+    const [items, total] = await Promise.all([
+      WastedModel.find(filter)
+        .populate("productId", "name ar_name code")
+        .populate({
+          path: "productPriceId",
+          select: "code price", // we'll ignore code in final output
+          populate: {
+            path: "productpriceoptions",
+            populate: {
+              path: "option",
+              populate: {
+                path: "variation",
+                select: "name ar_name",
+              },
+            },
+          },
+        })
+        .populate("warehouseId", "name")
+        .populate("userId", "username")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(Number(limit))
+        .lean(),
+      WastedModel.countDocuments(filter),
+    ]);
+
+    // Transform productPriceId to { name, price }
+    const transformedItems = items.map((item: any) => {
+      if (item.productPriceId) {
+        const price = item.productPriceId.price;
+        let name = "";
+        if (item.productPriceId.productpriceoptions && Array.isArray(item.productPriceId.productpriceoptions)) {
+          const optionNames = item.productPriceId.productpriceoptions
+            .map((po: any) => po.option?.name || po.option?.ar_name)
+            .filter(Boolean);
+          if (optionNames.length > 0) {
+            name = optionNames.join(" - ");
+          }
+        }
+        if (!name && item.productPriceId.name) {
+          name = item.productPriceId.name;
+        }
+        if (!name && item.productPriceId.code) {
+          name = item.productPriceId.code;
+        }
+        item.productPriceId = name ? { name, price } : null;
+      } else {
+        item.productPriceId = null;
+      }
+      return item;
+    });
+
+    SuccessResponse(res, {
+      message: "Wasted Fetched Successfully",
+      data: transformedItems,
+      pagination: {
+        total,
+        page: Number(page),
+        limit: Number(limit),
+        pages: Math.ceil(total / Number(limit)),
+      },
+    });
+  } catch (error: any) {
+    console.error("getAllWasted error:", error);
+    throw new ForbiddenError(error.message || "Failed to get wasted entries");
+  }
+};
+
+// ==================== Get Wasted By Id ====================
+export const getWastedById = async (req: Request, res: Response) => {
+  try {
+    const pricePopulate = {
+      path: "productPriceId",
+      select: "code price name",
+      populate: {
+        path: "productpriceoptions",
+        populate: {
+          path: "option",
+          populate: {
+            path: "variation",
+            select: "name ar_name",
+          },
+        },
+      },
+    };
+
+    let wasted: any = await WastedModel.findById(req.params.id)
+      .populate("productId", "name ar_name code")
+      .populate(pricePopulate)
+      .populate("warehouseId", "name")
+      .populate("userId", "name username")
+      .lean();
+
+    if (!wasted && mongoose.Types.ObjectId.isValid(req.params.id)) {
+      wasted = await WastedModel.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) })
+        .populate("productId", "name ar_name code")
+        .populate(pricePopulate)
+        .populate("warehouseId", "name")
+        .populate("userId", "name username")
+        .lean();
+    }
+
+    if (!wasted) {
+      wasted = await WastedModel.findOne({ _id: req.params.id })
+        .populate("productId", "name ar_name code")
+        .populate(pricePopulate)
+        .populate("warehouseId", "name")
+        .populate("userId", "name username")
+        .lean();
+    }
+
+    if (!wasted) throw new ForbiddenError("Wasted entry not found");
+
+    if (wasted.productPriceId) {
+      const price = wasted.productPriceId.price;
+      let name = "";
+      if (Array.isArray(wasted.productPriceId.productpriceoptions)) {
+        const optionNames = wasted.productPriceId.productpriceoptions
+          .map((po: any) => po.option?.name || po.option?.ar_name)
+          .filter(Boolean);
+        if (optionNames.length > 0) name = optionNames.join(" - ");
+      }
+      if (!name && wasted.productPriceId.name) name = wasted.productPriceId.name;
+      if (!name && wasted.productPriceId.code) name = wasted.productPriceId.code;
+      wasted.productPriceId = name ? { name, price } : null;
+    }
+
+    SuccessResponse(res, { message: "Wasted entry found", data: wasted });
+  } catch (error: any) {
+    console.error("getWastedById error:", error);
+    throw new ForbiddenError(error.message || "Failed to get wasted entry");
+  }
+};
+
+// ==================== Delete Wasted (restore stock) ====================
+export const deleteWasted = async (req: Request, res: Response) => {
+  try {
+    let wasted = await WastedModel.findById(req.params.id);
+    if (!wasted && mongoose.Types.ObjectId.isValid(req.params.id)) {
+      wasted = await WastedModel.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) });
+    }
+    if (!wasted) {
+      wasted = await WastedModel.findOne({ _id: req.params.id });
+    }
+    if (!wasted) throw new ForbiddenError("Wasted entry not found");
+
+    // Restore the stock back since the waste record is being voided
+    await Product_WarehouseModel.findOneAndUpdate(
+      {
+        productId: wasted.productId,
+        productPriceId: wasted.productPriceId,
+        warehouseId: wasted.warehouseId,
+      },
+      { $inc: { quantity: wasted.quantity } }
+    );
+
+    await WastedModel.deleteOne({ _id: req.params.id });
+
+    SuccessResponse(res, {
+      message: "Wasted entry deleted and stock restored",
+    });
+  } catch (error: any) {
+    console.error("deleteWasted error:", error);
+    throw new ForbiddenError(error.message || "Failed to delete wasted entry");
+  }
+};
+
+// ==================== Wasted Stats (loss valuation) ====================
+export const getWastedStats = async (req: Request, res: Response) => {
+  try {
+    const { warehouseId, from, to } = req.query as Record<string, string>;
+
+    const match: any = {};
+    if (warehouseId)
+      match.warehouseId = new mongoose.Types.ObjectId(warehouseId);
+    if (from || to) {
+      match.createdAt = {};
+      if (from) match.createdAt.$gte = new Date(from);
+      if (to) {
+        const toDate = new Date(to);
+        if (typeof to === "string" && to.length === 10) {
+          toDate.setHours(23, 59, 59, 999);
+        }
+        match.createdAt.$lte = toDate;
+      }
+    }
+
+    const stats = await WastedModel.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: "$reason",
+          totalQuantity: { $sum: "$quantity" },
+          totalLossValue: { $sum: { $multiply: ["$quantity", "$cost"] } },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { totalLossValue: -1 } },
+    ]);
+
+    SuccessResponse(res, { message: "Wasted stats found", data: stats });
+  } catch (error: any) {
+    console.error("getWastedStats error:", error);
+    throw new ForbiddenError(error.message || "Failed to get wasted stats");
+  }
+};
+
+export const updateWastedStatus = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { isApproved } = req.body;
+
+    let wasted = await WastedModel.findById(id);
+    if (!wasted && mongoose.Types.ObjectId.isValid(id)) {
+      wasted = await WastedModel.findOne({ _id: new mongoose.Types.ObjectId(id) });
+    }
+    if (!wasted) {
+      wasted = await WastedModel.findOne({ _id: id });
+    }
+    if (!wasted) {
+      throw new BadRequest("Wasted entry not found");
+    }
+
+  
+    const targetQuantity = wasted.quantity;
+
+    if (targetQuantity <= 0) {
+      throw new BadRequest("Quantity must be greater than 0");
+    }
+
+    // 1. إذا كان الطلب يتضمن الموافقة ولم يكن معتمداً من قبل
+    if (isApproved === true && !wasted.isApproved) {
+      const { productId, productPriceId, warehouseId } = wasted;
+
+      // أ) التحقق والخصم الذري من مخزون المستودع للتأكد من توفر الكمية
+      const stockDoc = await Product_WarehouseModel.findOneAndUpdate(
+        {
+          productId,
+          ...(productPriceId ? { productPriceId } : {}),
+          warehouseId,
+          quantity: { $gte: targetQuantity },
+        },
+        { $inc: { quantity: -targetQuantity } },
+        { new: true }
+      );
+
+      if (!stockDoc) {
+        throw new BadRequest(
+          "Not enough stock in this warehouse to approve this wasted quantity"
+        );
+      }
+
+      // ب) خصم الكمية من المنتج الرئيسي
+      const product = await ProductModel.findOneAndUpdate(
+        { _id: productId, quantity: { $gte: targetQuantity } },
+        { $inc: { quantity: -targetQuantity } },
+        { new: true }
+      );
+
+      if (!product) {
+        // Rollback للمستودع في حال فشل الخصم من المنتج
+        await Product_WarehouseModel.findOneAndUpdate(
+          { productId, ...(productPriceId ? { productPriceId } : {}), warehouseId },
+          { $inc: { quantity: targetQuantity } }
+        );
+        throw new BadRequest("Product not found or insufficient total quantity");
+      }
+
+      // ج) الخصم من سعر المنتج إن وجد
+      if (productPriceId) {
+        const productPrice = await ProductPriceModel.findOneAndUpdate(
+          { _id: productPriceId, quantity: { $gte: targetQuantity } },
+          { $inc: { quantity: -targetQuantity } },
+          { new: true }
+        );
+
+        if (!productPrice) {
+          // Rollback للمستودع والمنتج
+          await Product_WarehouseModel.findOneAndUpdate(
+            { productId, productPriceId, warehouseId },
+            { $inc: { quantity: targetQuantity } }
+          );
+          await ProductModel.findOneAndUpdate(
+            { _id: productId },
+            { $inc: { quantity: targetQuantity } }
+          );
+          throw new BadRequest("Product price variant not found or insufficient quantity");
+        }
+      }
+
+      // د) تحديث السجل إلى معتمد
+      wasted.isApproved = true;
+    }
+
+      await wasted.save();
+
+    SuccessResponse(res, {
+      message: "Wasted entry updated successfully",
+      wasted,
+    });
+  } catch (error: any) {
+    console.error("updateWastedStatus error:", error);
+    throw new BadRequest(error.message || "Failed to update wasted entry");
+  }
+};

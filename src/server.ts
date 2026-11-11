@@ -1,0 +1,109 @@
+import dotenv from "dotenv";
+import path from "path";
+// __dirname in your compiled file is dist/src/
+// We go up two directories to hit the root where the .env file lives
+const envPath = path.join(__dirname, "../../.env");
+dotenv.config({ path: envPath });
+
+import mongoose from "mongoose";
+import { syncPlugin } from "./models/schema/admin/POS/syncPlugin";
+mongoose.plugin(syncPlugin);
+
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import ApiRoute from "./routes/index";
+import { errorHandler } from "./middlewares/errorHandler";
+import { NotFound } from "./Errors";
+import cors from "cors";
+import cookieParser from "cookie-parser";
+import helmet from "helmet";
+import { connectDB } from "./models/connection";
+import { startCron } from "./utils/expiry_lowstock";
+import { seedOrderTypes } from "./seed/ordertype";
+import { ensureCashAccountForAllBranches } from "./utils/ensureCashAccount";
+import { ensureWarehouseEnabled } from "./utils/ensureWarehouseEnabled";
+import "./utils/bookingcheck";
+
+// dotenv.config();
+const app = express();
+
+// 🧩 Connect to DB
+connectDB().then(async () => {
+  await seedOrderTypes();
+
+  // ✅ الفروع القديمة اتعملت قبل ما نضيف حقل enabled، فممكن يكون ناقص فيها.
+  // من غير الـ backfill ده أي query بيفلتر بـ { enabled: true } مش هيلاقيها.
+  try {
+    const fixedBranches = await ensureWarehouseEnabled();
+    if (fixedBranches > 0) {
+      console.log(`✅ Enabled ${fixedBranches} legacy warehouse(s)`);
+    }
+  } catch (error) {
+    console.error("❌ Failed to backfill legacy warehouse enabled flag:", error);
+  }
+
+  // ✅ تأكد إن فيه حساب Cash مشترك على كل الفروع (Idempotent)
+  try {
+    await ensureCashAccountForAllBranches();
+  } catch (error) {
+    console.error("❌ Failed to ensure shared Cash account:", error);
+  }
+});
+
+// 🧠 Security & middleware
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(cors({ origin: "*" }));
+app.use(cookieParser());
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+
+// ✅ استخدم المسار الصحيح للـ uploads حتى بعد build مع كاش للمتصفح لمدة شهر
+const uploadsPath = path.join(__dirname, "../uploads");
+app.use(
+  "/uploads",
+  express.static(uploadsPath, {
+    maxAge: "30d",
+    etag: true,
+  })
+);
+
+// 🚀 Routes
+app.use("/test-updater",(req, res, next) => {
+  res.json("all right 2")
+})
+app.use("/api", ApiRoute);
+
+// ❌ Not found middleware
+app.use((req, res, next) => {
+  throw new NotFound("Route not found");
+});
+
+// ⚠️ Error handler
+app.use(errorHandler);
+
+// ⚙️ Create server & socket.io
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "*" },
+});
+app.set("io", io);
+
+// 🔌 Socket.IO connection
+io.on("connection", (socket) => {
+  console.log("✅ User connected:", socket.id);
+
+  socket.on("disconnect", () => {
+    console.log("❌ User disconnected:", socket.id);
+  });
+});
+
+// 🕒 Start cron jobs
+startCron(io);
+
+const PORT = process.env.PORT || 3000;
+
+// 🚀 Start server
+server.listen(PORT, () => {
+  console.log(`🚀 Server is running on http://localhost:${PORT}`);
+});

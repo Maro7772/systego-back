@@ -1,0 +1,35 @@
+import { randomUUID } from "crypto";
+import mongoose from "mongoose";
+
+const notificationSchema = new mongoose.Schema(
+  {
+    type: {
+      type: String,
+      enum: ["expiry", "expired", "low_stock", "new_order", "new_sale"],
+      required: true,
+    },
+    productId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Product",
+    },
+    purchaseItemId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "PurchaseItem",
+    },
+    message: {
+      type: String,
+      required: true,
+    },
+    isRead: {
+      type: Boolean,
+      default: false,
+    },
+    _id: {
+      type: mongoose.Schema.Types.String,
+      default: () => randomUUID(),
+    }
+  },
+  { _id: false, timestamps: true }
+);
+
+export const NotificationModel = mongoose.model("Notification", notificationSchema);
