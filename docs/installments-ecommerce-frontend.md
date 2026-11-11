@@ -1,14 +1,14 @@
-# التقسيط (Installments) — دليل فرونت الإيكومرس
+# Installments — E-commerce frontend guide
 
-النسخة دي مبنية على نفس اللي اتعمل في الـ POS، ونفس الـ endpoints بيرجع نفس الشكل
-عشان الفرونت ياخد نفس السلوك. **تحصيل الأقساط بيتم من الفرع / الأدمن فقط** — مفيش
-دفع أونلاين للأقساط.
+This version is based on the same implementation as the POS, and the same endpoints return the same shape
+so that the frontend gets the same behavior. **Installment collection happens only at the branch / by the admin** — there is no
+online payment for installments.
 
 ---
 
-## 1) قبل أي حاجة: إعدادات التقسيط
+## 1) Before anything: installment settings
 
-الأدمن بيحدد الفايدة من لوحة التحكم:
+The admin sets the interest from the admin panel:
 
 ```
 GET /api/admin/installments/settings
@@ -21,28 +21,28 @@ PUT /api/admin/installments/settings
 {
   "enabled": true,
   "interest_type": "percentage",   // "percentage" | "fixed"
-  "interest_value": 10,            // 10% من المبلغ الممول، أو 50 جنيه لكل قسط
+  "interest_value": 10,            // 10% of the financed amount, or 50 EGP per installment
   "max_installments": 12,
   "min_down_payment_percent": 0
 }
 ```
 
-المعنى:
+Meaning:
 
-| الحقل | المعنى |
+| Field | Meaning |
 |---|---|
-| `interest_type = "percentage"` | الفايدة = `(إجمالي الأوردر - المقدم) × interest_value / 100` |
-| `interest_type = "fixed"` | الفايدة = `interest_value × عدد الأقساط` |
-| `max_installments` | أقصى عدد أقساط مسموح |
-| `min_down_payment_percent` | أقل مقدم مسموح كنسبة من إجمالي الأوردر |
+| `interest_type = "percentage"` | Interest = `(order total - down payment) × interest_value / 100` |
+| `interest_type = "fixed"` | Interest = `interest_value × number of installments` |
+| `max_installments` | Maximum allowed number of installments |
+| `min_down_payment_percent` | Minimum allowed down payment as a percentage of the order total |
 
-> الفايدة بتتحسب **فقط** لو العميل اختار الدفع بالتقسيط. الدفع الكامل ما بيتأثرش.
+> Interest is calculated **only** if the customer chose to pay in installments. Full payment is not affected.
 
 ---
 
-## 2) الـ endpoints المتاحة للإيكومرس
+## 2) Endpoints available for e-commerce
 
-### 2.1 إعدادات التقسيط (عام — قبل تسجيل الدخول)
+### 2.1 Installment settings (public — before login)
 
 ```
 GET /api/store/installments/settings
@@ -66,9 +66,9 @@ Response:
 }
 ```
 
-استخدمها عشان تعرض/تخفي خيار "تقسيط" في الـ checkout، وتحدد أقصى عدد أقساط.
+Use it to show/hide the "Installments" option in the checkout, and to determine the maximum number of installments.
 
-### 2.2 معاينة الخطة (قبل تأكيد الأوردر)
+### 2.2 Plan preview (before confirming the order)
 
 ```
 POST /api/store/installments/preview
@@ -115,12 +115,12 @@ Response:
 }
 ```
 
-ملاحظات:
+Notes:
 
-- آخر قسط بياخد فرق التقريب، فمجموع الأقساط = `total_payable - down_payment` بالمليم.
-- أول قسط بعد شهر من تاريخ الأوردر.
-- أي خطأ في المدخلات (مقدم أكبر من الإجمالي، شهور > الحد، التقسيط مقفول…)
-  بيرجع `400` بالشكل:
+- The last installment absorbs the rounding difference, so the sum of the installments = `total_payable - down_payment` to the cent.
+- The first installment is due one month after the order date.
+- Any input error (down payment greater than the total, months > the limit, installments disabled…)
+  returns `400` in this shape:
 
 ```json
 {
@@ -129,41 +129,41 @@ Response:
 }
 ```
 
-### 2.3 إنشاء الأوردر بالتقسيط
+### 2.3 Creating an order with installments
 
-نفس الـ endpoint الحالي:
+The same existing endpoint:
 
 ```
 POST /api/store/order/checkout
 ```
 
-مع إضافة الحقلين دول:
+With these two fields added:
 
 ```json
 {
   "orderType": "delivery",
-  "shippingAddress": "<address id أو object زي ما هو>",
-  "paymentMethod": "<ObjectId لطريقة دفع فعّالة>",
+  "shippingAddress": "<address id or object as is>",
+  "paymentMethod": "<ObjectId of an active payment method>",
   "paymentType": "installment",
   "installment": {
     "months": 6,
     "down_payment": 500,
-    "notes": "ملاحظات اختيارية"
+    "notes": "optional notes"
   }
 }
 ```
 
-قواعد مهمة:
+Important rules:
 
-1. `paymentType` قيمته الافتراضية `"full"`. لو `"installment"` لازم `installment` موجود.
-2. **لازم العميل يكون مسجّل دخول** (الأوردر بيتربط بحسابه).
-3. `paymentMethod` مطلوب زي العادي، لكن **مش هيتم خصم أي مبلغ من الجيتواي**؛
-   الباك بيجبر `paymentGateway = "manual"` و`paymentStatus = "unpaid"`.
-   المقدم والأقساط بيتحصّلوا من الفرع.
-4. `down_payment` لازم:
-   - `>= min_down_payment_percent%` من إجمالي الأوردر
-   - `<` إجمالي الأوردر
-5. `months` عدد صحيح من `1` لـ `max_installments`.
+1. `paymentType` defaults to `"full"`. If it is `"installment"`, then `installment` must be present.
+2. **The customer must be logged in** (the order is linked to their account).
+3. `paymentMethod` is required as usual, but **no amount will be charged from the gateway**;
+   the backend forces `paymentGateway = "manual"` and `paymentStatus = "unpaid"`.
+   The down payment and the installments are collected at the branch.
+4. `down_payment` must:
+   - `>= min_down_payment_percent%` of the order total
+   - `<` the order total
+5. `months` is an integer from `1` to `max_installments`.
 
 Response (201):
 
@@ -213,12 +213,12 @@ Response (201):
 }
 ```
 
-`remaining_amount` في الخطة = `total_payable - down_payment - المدفوع من الأقساط`.
-`down_payment` نفسه مش جزء من `paid_amount` (بيتسجل في الفاتورة/الأوردر).
+`remaining_amount` in the plan = `total_payable - down_payment - what has been paid from the installments`.
+The `down_payment` itself is not part of `paid_amount` (it is recorded in the invoice/order).
 
-### 2.4 أقساط العميل (بعد الأوردر)
+### 2.4 Customer installments (after the order)
 
-كلها تحتاج `Authorization: Bearer <customer token>`:
+All of them require `Authorization: Bearer <customer token>`:
 
 ```
 GET /api/store/installments
@@ -247,7 +247,7 @@ GET /api/store/installments
         "remaining_amount": 4950,
         "status": "active",
         "customer_id": { "_id": "...", "name": "..." },
-        "warehouse_id": { "_id": "...", "name": "الفرع" }
+        "warehouse_id": { "_id": "...", "name": "Branch" }
       }
     ]
   }
@@ -255,70 +255,70 @@ GET /api/store/installments
 ```
 
 ```
-GET /api/store/installments/:id            // تفاصيل خطة + جدول الأقساط
-GET /api/store/installments/order/:orderId // خطة أوردر معيّن
+GET /api/store/installments/:id            // plan details + installment schedule
+GET /api/store/installments/order/:orderId // plan for a specific order
 ```
 
-حالات القسط (`status`): `pending` / `paid` / `overdue` / `cancelled`.
-حالة الخطة (`status`): `active` / `completed` / `cancelled`.
+Installment statuses (`status`): `pending` / `paid` / `overdue` / `cancelled`.
+Plan status (`status`): `active` / `completed` / `cancelled`.
 
 ---
 
-## 3) الشكل المطلوب في فرونت الإيكومرس (زي الـ POS)
+## 3) Required shape in the e-commerce frontend (like the POS)
 
-### خطوة الدفع في الـ checkout
+### Payment step in the checkout
 
-1. عند تحميل الـ checkout نادِ `GET /api/store/installments/settings`.
-2. لو `enabled = true` اعرض خيار **"تقسيط"** جنب الكاش/الكارت.
-3. لما العميل يختاره:
-   - Selector لعدد الأقساط: `1..max_installments`.
-   - Input للمقدم، مع `min = min_down_payment_percent% × total`.
-   - Debounce ~350ms ثم نادِ `POST /api/store/installments/preview`.
-   - اعرض ملخص:
-     - المبلغ الممول
-     - الفايدة
-     - إجمالي التقسيط
-     - القسط الشهري (وآخر قسط لو مختلف)
-     - **المطلوب الآن (المقدم)**
-   - زر "عرض جدول الأقساط" (accordion) بتواريخ الاستحقاق.
-4. زر "تأكيد الأوردر" يتقفل لو:
-   - التقسيط مقفول
-   - عدد الأقساط غير صالح
-   - المقدم أقل من الحد المسموح
-   - المعاينة لسه بتحمّل أو رجعت خطأ
-5. عند التأكيد ابعت `paymentType: "installment"` + `installment` مع نفس بيانات الـ checkout الحالية.
+1. When the checkout loads, call `GET /api/store/installments/settings`.
+2. If `enabled = true`, show the **"Installments"** option next to cash/card.
+3. When the customer selects it:
+   - A selector for the number of installments: `1..max_installments`.
+   - An input for the down payment, with `min = min_down_payment_percent% × total`.
+   - Debounce ~350ms, then call `POST /api/store/installments/preview`.
+   - Show a summary:
+     - The financed amount
+     - The interest
+     - The total installment amount
+     - The monthly installment (and the last installment if different)
+     - **Due now (the down payment)**
+   - A "Show installment schedule" button (accordion) with the due dates.
+4. The "Confirm order" button is disabled if:
+   - installments are disabled
+   - the number of installments is invalid
+   - the down payment is below the allowed minimum
+   - the preview is still loading or returned an error
+5. On confirmation, send `paymentType: "installment"` + `installment` along with the same current checkout data.
 
-### بعد إنشاء الأوردر
+### After the order is created
 
-- اعرض `installment_plan.plan_number` في شاشة النجاح.
-- وضّح للعميل: **الأقساط بتتحصّل من الفرع/الأدمن**، ومفيش دفع أونلاين للأقساط.
-- اعرض المقدم وتاريخ أول قسط.
+- Show `installment_plan.plan_number` on the success screen.
+- Explain to the customer: **installments are collected at the branch/by the admin**, and there is no online payment for installments.
+- Show the down payment and the first installment date.
 
-### صفحة "أقساطي"
+### "My installments" page
 
-- قائمة الخطط من `GET /api/store/installments`.
-- كل خطة: رقم الخطة، إجمالي التقسيط، المدفوع، المتبقي، الحالة.
-- تفاصيل: جدول الأقساط بالتواريخ والحالات (متأخر = لون تحذيري).
-- **مفيش زر دفع** في الإيكومرس (التحصيل من الفرع).
+- The plan list from `GET /api/store/installments`.
+- For each plan: plan number, total installment amount, paid, remaining, status.
+- Details: the installment schedule with dates and statuses (overdue = warning color).
+- **No payment button** in the e-commerce frontend (collection is at the branch).
 
 ---
 
-## 4) فروق مهمة عن الـ POS
+## 4) Important differences from the POS
 
-| البند | POS | الإيكومرس |
+| Item | POS | E-commerce |
 |---|---|---|
-| إنشاء الخطة | تلقائي مع `POST /api/admin/pos/sales` | تلقائي مع `POST /api/store/order/checkout` |
-| دفع المقدم | بيتحصّل فوراً على حساب مالي (`financials`) | بيتحصّل لاحقاً من الفرع |
-| دفع الأقساط | `PUT /api/admin/pos/installments/plans/:planId/items/:itemId/pay` | غير متاح — من الفرع/الأدمن فقط |
-| عرض الأقساط | صفحة "الأقساط" في الـ POS | صفحة "أقساطي" في المتجر |
+| Plan creation | Automatic with `POST /api/admin/pos/sales` | Automatic with `POST /api/store/order/checkout` |
+| Down payment | Collected immediately into a financial account (`financials`) | Collected later at the branch |
+| Installment payment | `PUT /api/admin/pos/installments/plans/:planId/items/:itemId/pay` | Not available — from the branch/admin only |
+| Viewing installments | The "Installments" page in the POS | The "My installments" page in the storefront |
 
 ---
 
-## 5) ملاحظات للتنفيذ
+## 5) Implementation notes
 
-- استخدم الـ `preview` من السيرفر بدل حساب الفايدة في الفرونت — عشان الأرقام
-  المعروضة تطابق اللي هيتسجل بالظبط.
-- الأوردر بيترجع `paymentStatus: "unpaid"` مع خطة تقسيط؛ ما تعتبرهاش خطأ دفع.
-- لو الـ API رجّع `400`، اعرض `error.message` كما هو (رسائل واضحة بالعربي/إنجليزي).
-- أي تعديل في إعدادات الفايدة من الأدمن بيسري على الأوردرات الجديدة فقط،
-  الخطط القديمة بتحتفظ بفايدتها وقت الإنشاء.
+- Use the server `preview` instead of calculating the interest in the frontend — so that the displayed numbers
+  match exactly what will be recorded.
+- The order returns `paymentStatus: "unpaid"` with an installment plan; do not treat that as a payment error.
+- If the API returns `400`, display `error.message` as is (clear messages in Arabic/English).
+- Any change to the interest settings by the admin applies only to new orders;
+  old plans keep the interest they had at the time of creation.

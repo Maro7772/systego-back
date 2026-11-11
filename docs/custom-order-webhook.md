@@ -40,20 +40,19 @@ When a customer creates an order from the storefront
 
 ```
 POST $ECOMMERCE_WEBHOOK_URL   (default: https://bcknd.smartego.org/api/webhooks/custom/order)
-Content-Type: application/json
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
 X-API-KEY: $ECOMMERCE_WEBHOOK_API_KEY  (falls back to SUPER_SYSTEGO_API_KEY)
 ```
 
-Body:
+Body (form-urlencoded, **not** JSON):
 
-```json
-{
-  "id": "11088739",
-  "customer_name": "أحمد محمود",
-  "customer_phone": "01206610346",
-  "total_price": 650,
-  "currency": "EGP"
-}
+```text
+id=11088739
+customer_name=Ahmed Mahmoud
+customer_phone=01206610346
+total_price=650
+currency=EGP
 ```
 
 - `id` is the Systego order `reference`. It is the value the platform should
